@@ -23,9 +23,7 @@ from ingraham.struct2seq.struct2seq import Struct2Seq
 
 from rich.progress import track 
 
-#device = torch.device("mps")
 
-# %%
 neighbors = 16 
 hidden = 128 
 
@@ -64,7 +62,7 @@ def transform_for_pyg(pkg):
     return data 
 
 
-max_samples = 200
+max_samples = 10_000
 data = []
 
 count = 0 
@@ -81,6 +79,7 @@ with torch.no_grad():
                 pass
             if count >= max_samples:
                 break 
+            
 n1 = int(count * 0.8)
 n2 = int(count * 0.9)
 
@@ -157,7 +156,7 @@ def train(model, data_loader, optimizer, criterion):
         prob_scores = F.softmax(out, dim=1)
         perplexity_sum += -torch.sum(torch.log(prob_scores[range(out.size(0)), data.y])).item()
 
-        print(f"{loss=:.2f} total_nodes={total_samples} {perplexity_sum=:.2f}")
+        print(f"{loss=:.2f} tokens={total_samples}")
     
     average_loss = total_loss / len(data_loader)
     accuracy = total_correct / total_samples * 100
@@ -207,33 +206,17 @@ model = GraphTransformerNetwork(num_node_features, num_edge_features, hidden_dim
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 criterion = torch.nn.CrossEntropyLoss()
 
-#device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-#model = model.to(device)
+train_data_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+val_data_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
 
-# Assume data_list is your list of graphs constructed using construct_graph function
-
-data_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-
-test_data_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
-
-# %%
-for batch in data_loader:
-    break  
-
-batch 
-
-# %%
-# with torch.no_grad():
-#     model(batch.x, batch.edge_index, batch.edge_attr)
-
-# %%
 # Main training loop
 for epoch in range(num_epochs):
-    train_loss, train_accuracy, train_perplexity = train(model, data_loader, optimizer, criterion)
-    test_loss, test_accuracy, test_perplexity = evaluate(model, test_data_loader, criterion)
+    train_loss, train_accuracy, train_perplexity = train(model, train_data_loader, optimizer, criterion)
+    val_loss, val_accuracy, val_perplexity = evaluate(model, val_data_loader, criterion)
     
-    print(f'Epoch {epoch+1:03d}, '
-          f'Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, Train Perplexity: {train_perplexity:.2f}, '
-          f'Test Loss: {test_loss:.4f}, Test Acc: {test_accuracy:.2f}%, Test Perplexity: {test_perplexity:.2f}')
-
+    print("'---------------------------------")
+    print(f'Epoch {epoch+1:03d}')
+    print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, Train Perplexity: {train_perplexity:.2f}')
+    print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.2f}%, Val Perplexity: {val_perplexity:.2f}')
+    print("'---------------------------------")
 
