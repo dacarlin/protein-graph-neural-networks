@@ -2,11 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, global_add_pool
-from torch_geometric.data import Data, DataLoader
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import RadiusGraph
 from Bio.PDB import PDBParser
 from Bio.Data import IUPACData
-import numpy as np
+import numpy as np 
+
+
+# Set seed for reproducibility 
+torch.manual_seed(42)
 
 
 # Constants
@@ -18,7 +23,7 @@ NUM_DIHEDRAL_FEATURES = 4  # phi, psi, omega, and chi1
 NUM_ATOM_FEATURES = 10  # Atom type, hybridization, aromaticity, etc.
 
 
-# Global alphabet
+# Global map from residues to tokens 
 aa_to_idx = {
     "ALA": 0,
     "ARG": 1,
@@ -41,7 +46,15 @@ aa_to_idx = {
     "TYR": 18,
     "VAL": 19,
 }
+
+# Reverse map of tokens to amino acids 
 idx_to_aa = {v: k for k, v in aa_to_idx.items()}
+
+
+
+###############################################################################
+# Main model implementation                                                   #
+###############################################################################
 
 
 class ProteinLigandGNN(nn.Module):
@@ -137,7 +150,10 @@ class ProteinLigandGNN(nn.Module):
         return self.output_layer(output)
 
 
-# Featurization --------------
+
+###############################################################################
+# Featurization                                                               #
+###############################################################################
 
 
 def rbf_encode(distances, num_rbf=NUM_RBF, max_distance=MAX_DISTANCE):
@@ -219,9 +235,9 @@ def calculate_dihedral(p1, p2, p3, p4):
     b1 = p2 - p1
     b2 = p3 - p2
     b3 = p4 - p3
-    n1 = torch.cross(b1, b2)
-    n2 = torch.cross(b2, b3)
-    m1 = torch.cross(n1, b2)
+    n1 = torch.linalg.cross(b1, b2)
+    n2 = torch.linalg.cross(b2, b3)
+    m1 = torch.linalg.cross(n1, b2)
     x = torch.dot(n1, n2)
     y = torch.dot(m1, n2)
     return torch.atan2(y, x)
@@ -329,7 +345,7 @@ def load_protein_ligand_graph(pdb_file):
 
     residues = list(structure.get_residues())
     ca_atoms = [residue["CA"] for residue in residues if "CA" in residue]
-    coords = torch.tensor([atom.coord for atom in ca_atoms], dtype=torch.float)
+    coords = torch.tensor(np.array([atom.coord for atom in ca_atoms]), dtype=torch.float)
 
     # Create k-nearest neighbors graph
     transform = RadiusGraph(r=MAX_DISTANCE, max_num_neighbors=MAX_NUM_NEIGHBORS)
@@ -347,8 +363,6 @@ def load_protein_ligand_graph(pdb_file):
 
     # Target (one-hot encoded amino acid types)
     amino_acids = [residue.resname for residue in residues if "CA" in residue]
-    # aa_to_idx = {aa: idx for idx, aa in enumerate(sorted(set(amino_acids)))}
-    print(aa_to_idx)
     y = torch.tensor([aa_to_idx[aa] for aa in amino_acids])
 
     # Extract ligand and small molecule information
@@ -376,6 +390,12 @@ def load_protein_ligand_graph(pdb_file):
         ligand_pos=ligand_coords,
         ligand_batch=ligand_batch,
     )
+
+
+
+###############################################################################
+# Training functions                                                          #
+###############################################################################
 
 
 def train(model, train_loader, optimizer, device):
@@ -411,10 +431,6 @@ def train(model, train_loader, optimizer, device):
         total_loss += loss.item()
 
     return total_loss / len(train_loader)
-
-
-import torch
-import torch.nn.functional as F
 
 
 def generate_sequence(model, data, device, temperature=1.0, top_k=None):
@@ -471,10 +487,12 @@ def generate_sequence(model, data, device, temperature=1.0, top_k=None):
     return "".join(sequence_letters)
 
 
-# Example usage:
-# generated_sequence = generate_sequence(model, test_data, device, temperature=0.8, top_k=5)
 
-# Main training loop
+###############################################################################
+# Main training loop                                                          #
+###############################################################################
+
+
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 model = ProteinLigandGNN(
     protein_features=NUM_DIHEDRAL_FEATURES,
@@ -483,9 +501,12 @@ model = ProteinLigandGNN(
     hidden_dim=64,
     num_layers=3,
 ).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
 
-# Assume we have a list of PDB files for training
+# Assume we have a list of PDB files for training from the CATH dataset, these
+# are the first three PDBs in "data/cath-dataset-nonredundant-S40.list", the files
+# are in a folder `data/dompdb` as downloaded (no extension) from the CATH server 
+
 pdb_files = ["data/dompdb/12asA00", "data/dompdb/132lA00", "data/dompdb/4a02A00"]
 dataset = [load_protein_ligand_graph(pdb_file) for pdb_file in pdb_files]
 train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
