@@ -16,6 +16,7 @@ From the orginal implementation and idea by John Ingraham: our goal is to create
 ## Goals for this repository 
 
 - [ ] Present a simple and understandable implementation of state of the art algorithms for graph-based protein design
+    - [ ] Create fast and flexible structure data loaders from PDB for PyTorch Geometric 
     - [x] Implement featurization from Ingraham
     - [x] Implement featurization scheme from ProteinMPNN
 - [ ] Train baseline models 
@@ -31,3 +32,5 @@ From the orginal implementation and idea by John Ingraham: our goal is to create
 `prepare_cath_dataset.ipynb`. Create the CATH dataset from raw files. Creates the files `chains.jsonl` and `splits.jsonl`. 
 
 `compare_features.ipynb`. Compare features from Ingraham and ProteinMPNN.  
+
+`train.py`. Implements a GAT model and the training loop.  
