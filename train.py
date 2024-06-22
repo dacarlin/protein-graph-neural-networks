@@ -349,9 +349,7 @@ def load_protein_ligand_graph(pdb_file):
     amino_acids = [residue.resname for residue in residues if "CA" in residue]
     # aa_to_idx = {aa: idx for idx, aa in enumerate(sorted(set(amino_acids)))}
     print(aa_to_idx)
-    y = F.one_hot(
-        torch.tensor([aa_to_idx[aa] for aa in amino_acids]), num_classes=NUM_AMINO_ACIDS
-    )
+    y = torch.tensor([aa_to_idx[aa] for aa in amino_acids])
 
     # Extract ligand and small molecule information
     ligand_atoms = [atom for atom in structure.get_atoms() if atom.parent.id[0] != " "]
@@ -407,7 +405,7 @@ def train(model, train_loader, optimizer, device):
             data.ligand_x,
             data.ligand_batch,
         )
-        loss = F.cross_entropy(out, data.y.argmax(dim=1))
+        loss = F.cross_entropy(out, data.y)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
