@@ -1,13 +1,19 @@
+from glob import glob 
+from datetime import datetime
+import os.path as osp
+import time 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, global_add_pool
-from torch_geometric.data import Data
+from torch_geometric.nn import GATConv, GATv2Conv, global_add_pool
+from torch_geometric.data import Data, Dataset 
 from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import RadiusGraph
 from Bio.PDB import PDBParser
 from Bio.Data import IUPACData
 import numpy as np 
+from rich.progress import track 
+from torch.utils.tensorboard import SummaryWriter
 
 
 # Set seed for reproducibility 
@@ -16,11 +22,12 @@ torch.manual_seed(42)
 
 # Constants
 NUM_AMINO_ACIDS = 20
-MAX_NUM_NEIGHBORS = 10
+MAX_NUM_NEIGHBORS = 16
 NUM_RBF = 16
-MAX_DISTANCE = 20.0
+MAX_DISTANCE = 32.0
 NUM_DIHEDRAL_FEATURES = 4  # phi, psi, omega, and chi1
 NUM_ATOM_FEATURES = 10  # Atom type, hybridization, aromaticity, etc.
+MAX_LENGTH = 512 
 
 
 # Global map from residues to tokens 
@@ -37,6 +44,9 @@ aa_to_idx = {
     "ILE": 9,
     "LEU": 10,
     "LYS": 11,
+        # add noncanonicals 
+        "DM0": 11, 
+        "MLY": 11, 
     "MET": 12,
     "PHE": 13,
     "PRO": 14,
@@ -49,6 +59,7 @@ aa_to_idx = {
 
 # Reverse map of tokens to amino acids 
 idx_to_aa = {v: k for k, v in aa_to_idx.items()}
+idx_to_aa.update({11: "LYS"})
 
 
 
@@ -80,11 +91,12 @@ class ProteinLigandGNN(nn.Module):
         self.protein_embedding = nn.Linear(protein_features, hidden_dim)
         self.ligand_embedding = nn.Linear(ligand_features, hidden_dim)
         self.edge_embedding = nn.Linear(edge_features, hidden_dim)
+        # add positional embeddings 
 
         # Multiple GAT layers for message passing
         self.gat_layers = nn.ModuleList(
             [
-                GATConv(hidden_dim, hidden_dim, heads=4, concat=False)
+                GATv2Conv(hidden_dim, hidden_dim, heads=4, concat=False, edge_dim=hidden_dim)
                 for _ in range(num_layers)
             ]
         )
@@ -114,6 +126,7 @@ class ProteinLigandGNN(nn.Module):
         """
         protein_x = self.protein_embedding(x)
         edge_attr = self.edge_embedding(edge_attr)
+        # add positional embeddings 
 
         # Handle the case where we input only a single sequence, as in generating
         if batch is None:
@@ -135,7 +148,7 @@ class ProteinLigandGNN(nn.Module):
             combined_x = ln(combined_x + x_res)
             combined_x = F.relu(combined_x)
 
-        # Global pooling of ligand features
+        # Global pooling of ligand features into a single "residue" at the end 
         if ligand_x.size(0) > 0:
             ligand_pooled = global_add_pool(ligand_x, ligand_batch)
         else:
@@ -143,7 +156,8 @@ class ProteinLigandGNN(nn.Module):
                 (1, self.protein_embedding.out_features), device=protein_x.device
             )
 
-        # Concatenate protein features with pooled ligand features
+        # Concatenate protein features with pooled ligand features, in the sequence dimension, 
+        # so the ligand is a fixed-sized representation like a residue is 
         protein_x = combined_x[: protein_x.size(0)]
         output = torch.cat([protein_x, ligand_pooled[batch]], dim=1)
 
@@ -271,16 +285,19 @@ def get_backbone_dihedrals(residues):
 
         # Calculate omega angle
         if i > 0:
-            prev_c = residues[i - 1]["C"].coord
-            curr_n = residues[i]["N"].coord
-            curr_ca = residues[i]["CA"].coord
-            curr_c = residues[i]["C"].coord
-            omega_angle = calculate_dihedral(
-                torch.tensor(prev_c),
-                torch.tensor(curr_n),
-                torch.tensor(curr_ca),
-                torch.tensor(curr_c),
-            )
+            try:
+                prev_c = residues[i - 1]["C"].coord
+                curr_n = residues[i]["N"].coord
+                curr_ca = residues[i]["CA"].coord
+                curr_c = residues[i]["C"].coord
+                omega_angle = calculate_dihedral(
+                    torch.tensor(prev_c),
+                    torch.tensor(curr_n),
+                    torch.tensor(curr_ca),
+                    torch.tensor(curr_c),
+                )
+            except KeyError:
+                omega_angle = 0.0    
         else:
             omega_angle = 0.0
 
@@ -344,11 +361,14 @@ def load_protein_ligand_graph(pdb_file):
     structure = parser.get_structure("protein", pdb_file)
 
     residues = list(structure.get_residues())
+    # remove HHOH, NA, CL, K, and other tings 
+    if len(residues) > MAX_LENGTH:
+        raise KeyError("too long")
     ca_atoms = [residue["CA"] for residue in residues if "CA" in residue]
     coords = torch.tensor(np.array([atom.coord for atom in ca_atoms]), dtype=torch.float)
 
     # Create k-nearest neighbors graph
-    transform = RadiusGraph(r=MAX_DISTANCE, max_num_neighbors=MAX_NUM_NEIGHBORS)
+    transform = RadiusGraph(r=MAX_DISTANCE, max_num_neighbors=MAX_NUM_NEIGHBORS, loop=False)
     data = Data(pos=coords)
     data = transform(data)
 
@@ -359,14 +379,19 @@ def load_protein_ligand_graph(pdb_file):
     edge_attr = rbf_encode(distances)
 
     # Node features (backbone dihedrals)
-    x = get_backbone_dihedrals(residues)
+    x = get_backbone_dihedrals(list(residue for residue in residues if "CA" in residue))
 
-    # Target (one-hot encoded amino acid types)
+    # Target (amino acid tokens)
     amino_acids = [residue.resname for residue in residues if "CA" in residue]
+    not_amino_acids = [residue.resname for residue in residues if not "CA" in residue]
+    #print(not_amino_acids)
+    
+    #print(pdb_file, amino_acids)
     y = torch.tensor([aa_to_idx[aa] for aa in amino_acids])
 
     # Extract ligand and small molecule information
     ligand_atoms = [atom for atom in structure.get_atoms() if atom.parent.id[0] != " "]
+    #print(ligand_atoms)
 
     if ligand_atoms:
         ligand_coords = torch.tensor(
@@ -380,6 +405,8 @@ def load_protein_ligand_graph(pdb_file):
 
     # Create a batch index for ligand atoms
     ligand_batch = torch.zeros(ligand_features.size(0), dtype=torch.long)
+
+    assert len(x) == len(y), f"{pdb_file} {len(x)} {len(y)}"
 
     return Data(
         x=x,
@@ -413,6 +440,7 @@ def train(model, train_loader, optimizer, device):
     """
     model.train()
     total_loss = 0
+    t0 = time.time()
 
     for data in train_loader:
         data = data.to(device)
@@ -430,7 +458,40 @@ def train(model, train_loader, optimizer, device):
         optimizer.step()
         total_loss += loss.item()
 
+        t1 = time.time()
+        dt = (t1 - t0)*1000 # time difference in miliseconds
+        #tokens_total = data.batch.size(0) * data.x.size(1)
+        #print(tokens_total, '64 examples')
+        tokens_per_sec = (data.x.size(0) * data.x.size(1)) / (t1 - t0)
+        print(f"loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+
     return total_loss / len(train_loader)
+
+
+def evaluate(model, val_loader, device):
+    """
+    Returns:
+        float: Average loss for the val set.
+    """
+    model.eval()
+    total_loss = 0
+
+    with torch.no_grad():
+        for data in val_loader:
+            data = data.to(device)
+            
+            out = model(
+                data.x,
+                data.edge_index,
+                data.edge_attr,
+                data.batch,
+                data.ligand_x,
+                data.ligand_batch,
+            )
+            loss = F.cross_entropy(out, data.y)
+            total_loss += loss.item()
+
+    return total_loss / len(val_loader)
 
 
 def generate_sequence(model, data, device, temperature=1.0, top_k=None):
@@ -501,25 +562,95 @@ model = ProteinLigandGNN(
     hidden_dim=64,
     num_layers=3,
 ).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+#model = torch.compile(model)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_dir = f"runs/experiment_{current_time}"
+writer = SummaryWriter(log_dir=log_dir)
 
 # Assume we have a list of PDB files for training from the CATH dataset, these
 # are the first three PDBs in "data/cath-dataset-nonredundant-S40.list", the files
 # are in a folder `data/dompdb` as downloaded (no extension) from the CATH server 
 
 pdb_files = ["data/dompdb/12asA00", "data/dompdb/132lA00", "data/dompdb/4a02A00"]
-dataset = [load_protein_ligand_graph(pdb_file) for pdb_file in pdb_files]
-train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
+#pdb_files = ["data/pdb/12AS.pdb", "data/pdb/132l.pdb", "data/pdb/153l.pdb"]
 
-num_epochs = 200
+class MyOwnDataset(Dataset):
+    def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
+        super().__init__(root, transform, pre_transform, pre_filter)
+
+    @property
+    def raw_file_names(self):
+        return glob("data/dompdb-split/train/*")
+
+    @property
+    def processed_file_names(self):
+        return list(f"data_{x}.pt" for x in range(29495))
+    
+    def download(self):
+        pass
+
+    def process(self):
+        idx = 0
+        for raw_path in self.raw_paths:
+            # Read data from `raw_path`.
+            try:
+                data = load_protein_ligand_graph(raw_path)
+            except KeyError:
+                continue # invalid structure or target 
+
+            if self.pre_filter is not None and not self.pre_filter(data):
+                continue
+
+            if self.pre_transform is not None:
+                data = self.pre_transform(data)
+
+            torch.save(data, osp.join(self.processed_dir, f'data_{idx}.pt'))
+            idx += 1
+
+    def len(self):
+        return len(self.processed_file_names)
+
+    def get(self, idx):
+        data = torch.load(osp.join(self.processed_dir, f'data_{idx}.pt'))
+        return data
+
+
+
+
+train_set = MyOwnDataset(".")
+train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+
+# Run training 
+num_epochs = 50
 for epoch in range(num_epochs):
     loss = train(model, train_loader, optimizer, device)
+    writer.add_scalar("epoch/loss/train", loss, epoch)
     print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss:.4f}")
+
+# Save the model 
+torch.save(model, "model.pt")
 
 # Generate sequence for a test protein
 test_pdb = "data/dompdb/12asA00"
+# test_pdb = "data/pdb/12AS.pdb"
 test_data = load_protein_ligand_graph(test_pdb).to(device)
 generated_sequence = generate_sequence(
     model, test_data, device, temperature=1.0, top_k=None
 )
 print("Generated sequence:", generated_sequence)
+
+# Evaluate on validaton set 
+val_files = glob("data/dompdb-split/val/*")
+dataset = []
+for pdb_file in track(val_files):
+    try:
+        dataset.append(load_protein_ligand_graph(pdb_file))
+    except KeyError:
+        pass 
+val_loader = DataLoader(dataset, batch_size=64, shuffle=False)
+
+loss = evaluate(model, val_loader, device)
+print(f"Val loss: {loss:4.4f}")
