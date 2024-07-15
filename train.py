@@ -1,6 +1,9 @@
+import gc 
+
 from glob import glob 
 from datetime import datetime
 import os.path as osp
+from random import shuffle, seed
 import time 
 import torch
 import torch.nn as nn
@@ -18,6 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Set seed for reproducibility 
 torch.manual_seed(42)
+seed(42)
 
 
 # Constants
@@ -440,19 +444,13 @@ def train(model, train_loader, optimizer, device):
     """
     model.train()
     total_loss = 0
-    t0 = time.time()
-
+    
     for data in train_loader:
+        t0 = time.time()
+        #print(data)
         data = data.to(device)
         optimizer.zero_grad()
-        out = model(
-            data.x,
-            data.edge_index,
-            data.edge_attr,
-            data.batch,
-            data.ligand_x,
-            data.ligand_batch,
-        )
+        out = model(data.x, data.edge_index, data.edge_attr, data.batch, data.ligand_x, data.ligand_batch)
         loss = F.cross_entropy(out, data.y)
         loss.backward()
         optimizer.step()
@@ -460,16 +458,21 @@ def train(model, train_loader, optimizer, device):
 
         t1 = time.time()
         dt = (t1 - t0)*1000 # time difference in miliseconds
-        #tokens_total = data.batch.size(0) * data.x.size(1)
-        #print(tokens_total, '64 examples')
         tokens_per_sec = (data.x.size(0) * data.x.size(1)) / (t1 - t0)
-        print(f"loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+        print(f"x={data.x.shape} loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
     return total_loss / len(train_loader)
 
 
 def evaluate(model, val_loader, device):
     """
+    Evaluate the model on the validation set 
+
+    Args:
+        model (ProteinLigandGNN): The model to train.
+        val_loader (DataLoader): DataLoader for validation data.
+        device (torch.device): Device to use for training.
+
     Returns:
         float: Average loss for the val set.
     """
@@ -479,15 +482,7 @@ def evaluate(model, val_loader, device):
     with torch.no_grad():
         for data in val_loader:
             data = data.to(device)
-            
-            out = model(
-                data.x,
-                data.edge_index,
-                data.edge_attr,
-                data.batch,
-                data.ligand_x,
-                data.ligand_batch,
-            )
+            out = model(data.x, data.edge_index, data.edge_attr, data.batch, data.ligand_x, data.ligand_batch)
             loss = F.cross_entropy(out, data.y)
             total_loss += loss.item()
 
@@ -577,51 +572,81 @@ writer = SummaryWriter(log_dir=log_dir)
 pdb_files = ["data/dompdb/12asA00", "data/dompdb/132lA00", "data/dompdb/4a02A00"]
 #pdb_files = ["data/pdb/12AS.pdb", "data/pdb/132l.pdb", "data/pdb/153l.pdb"]
 
-class MyOwnDataset(Dataset):
-    def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
-        super().__init__(root, transform, pre_transform, pre_filter)
 
-    @property
-    def raw_file_names(self):
-        return glob("data/dompdb-split/train/*")
+# from torch_geometric.data import Dataset, download_url
 
-    @property
-    def processed_file_names(self):
-        return list(f"data_{x}.pt" for x in range(29495))
+# class StructureDataset(Dataset):
+#     def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
+#         super().__init__(root, transform, pre_transform, pre_filter)
+#         self.filenames = glob(f"processed/data*.pt")         
+
+#     # @property
+#     # def raw_file_names(self):
+#     #     return glob(f"data/dompdb/*") 
+
+#     # @property
+#     # def processed_file_names(self):
+#     #     return list(f"data_{x}.pt" for x in range(len(self.raw_file_names)))
     
-    def download(self):
-        pass
+#     # def download(self):
 
-    def process(self):
-        idx = 0
-        for raw_path in self.raw_paths:
-            # Read data from `raw_path`.
-            try:
-                data = load_protein_ligand_graph(raw_path)
-            except KeyError:
-                continue # invalid structure or target 
+        
 
-            if self.pre_filter is not None and not self.pre_filter(data):
-                continue
+#     # def process(self):
+#     #     idx = 0
+#     #     for raw_path in self.raw_paths:
+#     #         # Read data from `raw_path`.
+#     #         try:
+#     #             data = load_protein_ligand_graph(raw_path)
+#     #         except KeyError:
+#     #             continue # invalid structure or target 
 
-            if self.pre_transform is not None:
-                data = self.pre_transform(data)
+#     #         if self.pre_filter is not None and not self.pre_filter(data):
+#     #             continue
 
-            torch.save(data, osp.join(self.processed_dir, f'data_{idx}.pt'))
-            idx += 1
+#     #         if self.pre_transform is not None:
+#     #             data = self.pre_transform(data)
 
-    def len(self):
-        return len(self.processed_file_names)
+#     #         torch.save(data, osp.join(self.processed_dir, f'data_{idx}.pt'))
+#     #         idx += 1
 
-    def get(self, idx):
-        data = torch.load(osp.join(self.processed_dir, f'data_{idx}.pt'))
-        return data
+#     def len(self):
+#         return len(self.filenames)
+
+#     def get(self, idx):
+#         data = torch.load(osp.join("processed", f'data_{idx}.pt'))
+#         return data
 
 
+# dataset = StructureDataset(root=".")
+# n1 = int(0.8 * len(dataset))
+# n2 = int(0.9 * len(dataset))
+# train_idx = torch.arange(0, n1)
+# val_idx = torch.arange(n1, n2)
+# test_idx = torch.arange(n2, len(dataset))
+# print(val_idx)
+# train_loader = DataLoader(dataset, batch_size=32, shuffle=False, exclude_keys=val_idx.tolist() + test_idx.tolist())
 
+MAX_SAMPLES = 15_000
+pdb_files = glob("data/dompdb/*")[:MAX_SAMPLES]
+shuffle(pdb_files)
+n1 = int(0.8 * len(pdb_files))
+n2 = int(0.9 * len(pdb_files))
+train_files = pdb_files[:n1]
+val_files = pdb_files[n1:n2]
+test_files = pdb_files[n2:]
 
-train_set = MyOwnDataset(".")
-train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+print(f'number of examples in train={len(train_files)} val={len(val_files)} test={len(test_files)}')
+
+# Load training examples 
+train_set = []
+for pdb_file in track(train_files, description=f"Loading training samples (n={len(train_files)})"):
+    try:
+        train_set.append(load_protein_ligand_graph(pdb_file))
+    except KeyError:
+        pass 
+train_loader = DataLoader(train_set, batch_size=32, shuffle=False)
+
 
 # Run training 
 num_epochs = 50
@@ -633,9 +658,9 @@ for epoch in range(num_epochs):
 # Save the model 
 torch.save(model, "model.pt")
 
-# Generate sequence for a test protein
-test_pdb = "data/dompdb/12asA00"
-# test_pdb = "data/pdb/12AS.pdb"
+# Generate sequence for a single test protein 
+#test_pdb = test_files[0]
+test_pdb = "data/dompdb/1a00B00"
 test_data = load_protein_ligand_graph(test_pdb).to(device)
 generated_sequence = generate_sequence(
     model, test_data, device, temperature=1.0, top_k=None
@@ -643,14 +668,13 @@ generated_sequence = generate_sequence(
 print("Generated sequence:", generated_sequence)
 
 # Evaluate on validaton set 
-val_files = glob("data/dompdb-split/val/*")
-dataset = []
-for pdb_file in track(val_files):
+val_set = []
+for pdb_file in track(val_files, description=f"Loading validation samples (n={len(val_files)})"):
     try:
-        dataset.append(load_protein_ligand_graph(pdb_file))
+        val_set.append(load_protein_ligand_graph(pdb_file))
     except KeyError:
         pass 
-val_loader = DataLoader(dataset, batch_size=64, shuffle=False)
+val_loader = DataLoader(val_set, batch_size=32, shuffle=False)
 
 loss = evaluate(model, val_loader, device)
 print(f"Val loss: {loss:4.4f}")
